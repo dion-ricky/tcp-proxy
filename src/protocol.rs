@@ -37,8 +37,15 @@ pub enum Message {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HelloKind {
-    Control { local_port: u16 },
-    Response { port: u16 },
+    Control {
+        local_port: u16,
+        /// Port the client would like, if any. Server may refuse.
+        #[serde(default)]
+        requested_port: Option<u16>,
+    },
+    Response {
+        port: u16,
+    },
 }
 
 #[cfg(test)]
@@ -54,7 +61,14 @@ mod tests {
             Message::Authenticate {
                 mac: "deadbeef".into(),
             },
-            Message::Hello(HelloKind::Control { local_port: 3000 }),
+            Message::Hello(HelloKind::Control {
+                local_port: 3000,
+                requested_port: None,
+            }),
+            Message::Hello(HelloKind::Control {
+                local_port: 3000,
+                requested_port: Some(8080),
+            }),
             Message::Hello(HelloKind::Response { port: 51234 }),
             Message::Heartbeat,
             Message::Error {

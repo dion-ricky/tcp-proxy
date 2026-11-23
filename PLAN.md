@@ -58,11 +58,16 @@ Flow:
 - [x] Heartbeats on the control channel
 - [x] Cleanup when the client disconnects (drop the public listener, remove pending entries)
 - [x] Shared-secret auth (challenge/response, e.g. HMAC)
-- [ ] Optional: request a specific public port, port range limits
+- [x] Optional: request a specific public port, port range limits
 
 > Verified 2026-11-23: 90s idle tunnel survives, `SIGSTOP`ed client reaped at
 > 45s, parked visitor reaper fires at 30s, auth replay rejected on a fresh
 > nonce, wrong secret allocates no port.
+>
+> Verified 2026-11-24: requested port honoured exactly, out-of-range and busy
+> ports refused with a reason, 20 concurrent tunnels get distinct in-range
+> ports, an exhausted range fails cleanly, and a client that predates
+> `requested_port` still connects.
 
 ## Concepts to focus on
 - **Framing:** TCP is a byte stream, not messages

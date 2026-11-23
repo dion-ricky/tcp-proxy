@@ -24,6 +24,10 @@ struct Args {
     /// Shared secret; must match the server's
     #[arg(long, env = "TCP_PROXY_SECRET")]
     secret: String,
+
+    /// Public port to as for (server may refuse)
+    #[arg(long)]
+    requested_port: Option<u16>,
 }
 
 /// One event in the control-channel loop.
@@ -46,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
             &mut stream,
             &Message::Hello(HelloKind::Control {
                 local_port: args.local_port,
+                requested_port: args.requested_port,
             }),
         ),
     )
@@ -57,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         .context("timed out waiting for server reply")??
     {
         Some(Message::Hello(HelloKind::Response { port })) => println!("public port: {port}"),
+        Some(Message::Error { message }) => bail!("server refused: {message}"),
         Some(other) => bail!("unexpected reply: {other:?}"),
         None => bail!("server closed the connection during handshake"),
     }

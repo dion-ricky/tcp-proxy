@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::Parser;
 use dashmap::DashMap;
 use tcp_proxy::{
@@ -61,6 +61,26 @@ impl Drop for PendingGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PortRange {
+    min: u16,
+    max: u16,
+}
+
+impl std::str::FromStr for PortRange {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (min, max) = s
+            .split_once('-')
+            .context("expected MIN-MAX, e.g. 20000-30000")?;
+        let min: u16 = min.parse().context("invalid minimum port")?;
+        let max: u16 = max.parse().context("invalid maximum port")?;
+        anyhow::ensure!(min > 0 && min <= max, "invalid port range {min}-{max}");
+        Ok(Self { min, max })
+    }
+}
+
 #[derive(Parser)]
 struct Args {
     /// Address the control port listens on
@@ -70,39 +90,52 @@ struct Args {
     /// Shared secret clients must authenticate with
     #[arg(long, env = "TCP_PROXY_SECRET")]
     secret: String,
+
+    /// Allowed public port range
+    #[arg(long, default_value = "20000-30000")]
+    port_range: PortRange,
+}
+
+#[derive(Clone)]
+struct Ctx {
+    pending: Pending,
+    secret: Arc<String>,
+    port_range: PortRange,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let Args { bind, secret } = Args::parse();
-    let secret = Arc::new(secret);
-    let pending: Pending = Pending::default();
+    let Args {
+        bind,
+        secret,
+        port_range,
+    } = Args::parse();
+    let ctx = Ctx {
+        pending: Pending::default(),
+        secret: Arc::new(secret),
+        port_range,
+    };
 
     let listener = TcpListener::bind(&bind).await?;
     println!("Listening on {bind}");
 
     loop {
         let (stream, addr) = listener.accept().await?;
-        let pending = Arc::clone(&pending);
-        let secret = Arc::clone(&secret);
+        let ctx = ctx.clone();
         println!("Accepted connection from {addr}");
 
         tokio::spawn(async move {
-            if let Err(err) = handle_control(stream, pending, secret).await {
+            if let Err(err) = handle_control(stream, ctx).await {
                 eprintln!("control connection failed: {err:#}");
             }
         });
     }
 }
 
-async fn handle_control(
-    stream: TcpStream,
-    pending: Pending,
-    secret: Arc<String>,
-) -> anyhow::Result<()> {
+async fn handle_control(stream: TcpStream, ctx: Ctx) -> anyhow::Result<()> {
     let mut control = MessageStream::new(stream, LinesCodec::new());
 
-    if !authenticate(&mut control, secret.as_str()).await? {
+    if !authenticate(&mut control, ctx.secret.as_str()).await? {
         eprintln!("authentication failed");
         return Ok(());
     }
@@ -113,10 +146,11 @@ async fn handle_control(
     };
 
     match first {
-        Some(Message::Hello(HelloKind::Control { local_port })) => {
-            run_tunnel(control, local_port, pending).await
-        }
-        Some(Message::Accept { id }) => handle_accept(control, id, pending).await,
+        Some(Message::Hello(HelloKind::Control {
+            local_port,
+            requested_port,
+        })) => run_tunnel(control, local_port, requested_port, ctx).await,
+        Some(Message::Accept { id }) => handle_accept(control, id, ctx.pending).await,
         Some(other) => bail!("unexpected first message: {other:?}"),
         None => Ok(()),
     }
@@ -152,10 +186,25 @@ async fn authenticate(control: &mut MessageStream, secret: &str) -> anyhow::Resu
 async fn run_tunnel(
     mut control: MessageStream,
     local_port: u16,
-    pending: Pending,
+    requested_port: Option<u16>,
+    ctx: Ctx,
 ) -> anyhow::Result<()> {
-    let mut guard = PendingGuard::new(Arc::clone(&pending));
-    let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
+    let mut guard = PendingGuard::new(Arc::clone(&ctx.pending));
+
+    let listener = match bind_public(ctx.port_range, requested_port).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            let message = format!("{err:#}");
+            let _ = send(
+                &mut control,
+                &Message::Error {
+                    message: message.clone(),
+                },
+            )
+            .await;
+            bail!("{message}");
+        }
+    };
     let public_port = listener.local_addr()?.port();
 
     send(
@@ -186,10 +235,10 @@ async fn run_tunnel(
 
             Ev::Visitor(visitor) => {
                 let id = Uuid::new_v4();
-                pending.insert(id, visitor);
+                ctx.pending.insert(id, visitor);
                 guard.track(id);
 
-                let reaper = Arc::clone(&pending);
+                let reaper = Arc::clone(&ctx.pending);
                 tokio::spawn(async move {
                     sleep(PENDING_TIMEOUT).await;
                     if reaper.remove(&id).is_some() {
@@ -208,6 +257,34 @@ async fn run_tunnel(
     }
 
     Ok(())
+}
+
+async fn bind_public(range: PortRange, requested: Option<u16>) -> anyhow::Result<TcpListener> {
+    if let Some(port) = requested {
+        anyhow::ensure!(
+            (range.min..=range.max).contains(&port),
+            "requested port {port} is outside the allowed range {}-{}",
+            range.min,
+            range.max
+        );
+        return TcpListener::bind(("0.0.0.0", port))
+            .await
+            .with_context(|| format!("public port {port} is unavailable"));
+    }
+
+    let span = range.max - range.min + 1;
+    let start = Uuid::new_v4().as_u128() as u16 % span;
+
+    for offset in 0..span.min(200) {
+        let port = range.min + (start + offset) % span;
+        match TcpListener::bind(("0.0.0.0", port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(err) => return Err(err).with_context(|| format!("binding public port {port}")),
+        }
+    }
+
+    bail!("no free port in range {}-{}", range.min, range.max)
 }
 
 /// Deadline for the next heartbeat, refreshed on every control message.
@@ -244,4 +321,30 @@ async fn handle_accept(
     let (up, down) = copy_bidirectional(&mut visitor, &mut client).await?;
     println!("tunnel {id}: {up} bytes up, {down} bytes down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_normal_range() {
+        let r: PortRange = "20000-30000".parse().unwrap();
+        assert_eq!((r.min, r.max), (20000, 30000));
+    }
+
+    #[test]
+    fn rejects_inverted_range() {
+        assert!("30000-20000".parse::<PortRange>().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_min() {
+        assert!("0-100".parse::<PortRange>().is_err());
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!("abc".parse::<PortRange>().is_err());
+    }
 }
